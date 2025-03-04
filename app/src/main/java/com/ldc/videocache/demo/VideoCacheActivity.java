@@ -32,7 +32,8 @@ public class VideoCacheActivity extends AppCompatActivity {
     private VideoCacheManager cacheManager;
     private boolean isM3u8Caching = false;
     private Handler handler;
-    private static final int UPDATE_INTERVAL = 1000; // 1秒更新一次
+    private static final int UPDATE_INTERVAL = 500; // Update every 500ms for smoother playback
+    private static final int BUFFER_SEGMENTS_AHEAD = 5; // Define BUFFER_SEGMENTS_AHEAD
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -75,6 +76,45 @@ public class VideoCacheActivity extends AppCompatActivity {
                     case Player.STATE_IDLE:
                         statusText.setText("播放器空闲");
                         break;
+                }
+            }
+
+            @Override
+            public void onPositionDiscontinuity(Player.PositionInfo oldPosition, 
+                                              Player.PositionInfo newPosition, 
+                                              @Player.DiscontinuityReason int reason) {
+                if (m3u8Cache != null) {
+                    // Calculate current segment based on accumulated durations
+                    long positionMs = player.getCurrentPosition();
+                    float positionSeconds = positionMs / 1000.0f;
+                    float accumulatedDuration = 0;
+                    int currentSegment = 0;
+                    
+                    // Get total segments
+                    int totalSegments = m3u8Cache.getTotalSegments();
+                    
+                    // Find current segment based on position
+                    while (currentSegment < totalSegments) {
+                        float segmentDuration = m3u8Cache.getSegmentDuration(
+                            m3u8Cache.getSegmentFileName(currentSegment)
+                        );
+                        if (accumulatedDuration + segmentDuration > positionSeconds) {
+                            break;
+                        }
+                        accumulatedDuration += segmentDuration;
+                        currentSegment++;
+                    }
+                    
+                    // Update current playing segment
+                    m3u8Cache.setCurrentPlayingSegment(currentSegment);
+                    
+                    // Pre-fetch next segments if needed
+                    if (currentSegment >= 0 && currentSegment < totalSegments) {
+                        m3u8Cache.ensureSegmentsCached(
+                            currentSegment,
+                            Math.min(currentSegment + BUFFER_SEGMENTS_AHEAD, totalSegments - 1)
+                        );
+                    }
                 }
             }
         });
@@ -242,6 +282,45 @@ public class VideoCacheActivity extends AppCompatActivity {
                 public void onPlayerError(PlaybackException error) {
                     Log.e(TAG, "Player error: " + error.getMessage());
                     statusText.setText("Playback error: " + error.getMessage());
+                }
+
+                @Override
+                public void onPositionDiscontinuity(Player.PositionInfo oldPosition, 
+                                                  Player.PositionInfo newPosition, 
+                                                  @Player.DiscontinuityReason int reason) {
+                    if (m3u8Cache != null) {
+                        // Calculate current segment based on accumulated durations
+                        long positionMs = player.getCurrentPosition();
+                        float positionSeconds = positionMs / 1000.0f;
+                        float accumulatedDuration = 0;
+                        int currentSegment = 0;
+                        
+                        // Get total segments
+                        int totalSegments = m3u8Cache.getTotalSegments();
+                        
+                        // Find current segment based on position
+                        while (currentSegment < totalSegments) {
+                            float segmentDuration = m3u8Cache.getSegmentDuration(
+                                m3u8Cache.getSegmentFileName(currentSegment)
+                            );
+                            if (accumulatedDuration + segmentDuration > positionSeconds) {
+                                break;
+                            }
+                            accumulatedDuration += segmentDuration;
+                            currentSegment++;
+                        }
+                        
+                        // Update current playing segment
+                        m3u8Cache.setCurrentPlayingSegment(currentSegment);
+                        
+                        // Pre-fetch next segments if needed
+                        if (currentSegment >= 0 && currentSegment < totalSegments) {
+                            m3u8Cache.ensureSegmentsCached(
+                                currentSegment,
+                                Math.min(currentSegment + BUFFER_SEGMENTS_AHEAD, totalSegments - 1)
+                            );
+                        }
+                    }
                 }
             });
             

@@ -18,6 +18,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.PriorityBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -29,6 +31,13 @@ public class M3U8Cache {
     private static final int RETRY_DELAY_MS = 1000;
     private static final int VALIDATION_TIMEOUT = 5000; // 5 seconds for validation
     private static final int MAX_VALIDATION_RETRIES = 2;
+    private static final int BUFFER_SEGMENTS_AHEAD = 8;
+    private static final int CORE_POOL_SIZE = 5;
+    private static final int MAX_POOL_SIZE = 8;
+    private static final int KEEP_ALIVE_TIME = 60; // seconds
+    private static final int INITIAL_SEGMENTS_TO_CACHE = 12;
+    private static final float PLAYBACK_START_THRESHOLD = 0.4f;
+    private static final int MINIMUM_SEGMENTS_FOR_PLAYBACK = 12;
 
     private String baseUrl;
     private final File cacheDir;
@@ -41,8 +50,10 @@ public class M3U8Cache {
     private volatile boolean isDownloading;
     private CacheListener cacheListener;
     private List<String> fallbackBaseUrls = new ArrayList<>();
-    private static final float PLAYBACK_START_THRESHOLD = 0.1f; // Play starts when cache reaches 10%
     private boolean hasNotifiedReadyForPlayback = false;
+    private volatile int currentPlayingSegment = 0;
+    private Map<String, Float> segmentDurations = new HashMap<>();
+    private float defaultSegmentDuration = 10.0f;
 
     public interface CacheListener {
         void onProgress(int completed, int total, int failed);
@@ -54,13 +65,24 @@ public class M3U8Cache {
     public M3U8Cache(String url, File cacheDir) {
         this.baseUrl = getBaseUrl(url);
         this.cacheDir = new File(cacheDir, "m3u8");
-        this.executor = Executors.newFixedThreadPool(3);
+        Log.d(TAG, "Initializing M3U8Cache with cache directory: " + this.cacheDir.getAbsolutePath());
+        this.executor = new ThreadPoolExecutor(
+            CORE_POOL_SIZE,
+            MAX_POOL_SIZE,
+            KEEP_ALIVE_TIME,
+            TimeUnit.SECONDS,
+            new PriorityBlockingQueue<>(),
+            new ThreadPoolExecutor.CallerRunsPolicy()
+        );
         this.tsUrls = new ArrayList<>();
         this.completedSegments = new AtomicInteger(0);
         this.failedSegments = new AtomicInteger(0);
         this.consecutiveFailures = new AtomicInteger(0);
         if (!this.cacheDir.exists()) {
-            this.cacheDir.mkdirs();
+            boolean created = this.cacheDir.mkdirs();
+            Log.d(TAG, "Cache directory created: " + created + " at " + this.cacheDir.getAbsolutePath());
+        } else {
+            Log.d(TAG, "Cache directory already exists at " + this.cacheDir.getAbsolutePath());
         }
     }
 
@@ -156,21 +178,7 @@ public class M3U8Cache {
                 }
             }
 
-            for (String segment : segments) {
-                if (isCanceled) {
-                    Log.d(TAG, "M3U8 caching canceled");
-                    break;
-                }
-                String workingUrl = findWorkingTsUrl(segment);
-                if (workingUrl != null) {
-                    tsUrls.add(workingUrl);
-                    executor.execute(() -> downloadTs(workingUrl));
-                } else {
-                    Log.e(TAG, "Cannot find working URL for segment: " + segment);
-                    failedSegments.incrementAndGet();
-                    updateProgress();
-                }
-            }
+            queueSegmentDownloads(segments);
 
             // 等待所有下载任务完成或取消
             executor.shutdown();
@@ -324,24 +332,117 @@ public class M3U8Cache {
     private List<String> parseM3U8Content(String content) {
         List<String> segments = new ArrayList<>();
         String[] lines = content.split("\n");
+        float currentDuration = -1;  // Initialize to invalid duration
+        int segmentCount = 0;
 
-        for (String line : lines) {
-            line = line.trim();
-            if (!line.startsWith("#") && !line.isEmpty() && line.endsWith(".ts")) {
+        Log.d(TAG, "Starting to parse M3U8 content...");
+
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i].trim();
+            if (line.startsWith("#EXTINF:")) {
+                try {
+                    // Parse the duration value (format: #EXTINF:duration,title)
+                    String durationStr = line.substring(8);
+                    if (durationStr.contains(",")) {
+                        durationStr = durationStr.substring(0, durationStr.indexOf(','));
+                    }
+                    currentDuration = Float.parseFloat(durationStr);
+                    Log.d(TAG, "Found segment " + (segmentCount + 1) + " with duration: " + currentDuration);
+                } catch (Exception e) {
+                    Log.w(TAG, "Failed to parse EXTINF duration: " + line, e);
+                    currentDuration = -1;  // Reset to invalid duration
+                }
+            } else if (!line.startsWith("#") && !line.isEmpty() && line.endsWith(".ts")) {
+                segmentCount++;
                 segments.add(line);
-                Log.d(TAG, "Found segment: " + line);
+                String fileName = line.substring(line.lastIndexOf('/') + 1);
+                if (currentDuration > 0) {
+                    segmentDurations.put(fileName, currentDuration);
+                    Log.d(TAG, String.format("Added segment %d: %s with duration %.3f", segmentCount, fileName, currentDuration));
+                } else {
+                    Log.w(TAG, "No valid duration found for segment: " + fileName + ", using default duration");
+                    segmentDurations.put(fileName, defaultSegmentDuration);
+                }
+                currentDuration = -1;  // Reset after using
             }
         }
 
         if (segments.isEmpty()) {
             Log.w(TAG, "No TS segments found in playlist");
+        } else {
+            Log.d(TAG, String.format("Found total of %d segments in M3U8 content", segments.size()));
+            // Log all segment durations for verification
+            for (String segment : segments) {
+                String fileName = segment.substring(segment.lastIndexOf('/') + 1);
+                Log.d(TAG, String.format("Segment %s has duration %.3f", fileName, segmentDurations.get(fileName)));
+            }
         }
 
         return segments;
     }
 
+    private void queueSegmentDownloads(List<String> segments) {
+        Log.d(TAG, "Starting to queue segment downloads for " + segments.size() + " segments");
+        
+        // First, add all segments to tsUrls list to maintain the complete list
+        synchronized (tsUrls) {
+            tsUrls.clear(); // Clear existing URLs to avoid duplicates
+            for (String segment : segments) {
+                String fileName = segment.substring(segment.lastIndexOf('/') + 1);
+                String fullUrl = segment.startsWith("http") ? segment : baseUrl + segment;
+                tsUrls.add(fullUrl);
+                Log.d(TAG, "Added segment to tsUrls: " + fileName);
+            }
+            Log.d(TAG, "Total segments in tsUrls after adding all: " + tsUrls.size());
+        }
+
+        // Now queue the downloads
+        for (String segment : segments) {
+            String workingUrl = findWorkingTsUrl(segment);
+            if (workingUrl != null) {
+                executor.execute(new PrioritizedDownloadTask(workingUrl, 1));
+                Log.d(TAG, "Queued download for segment: " + segment.substring(segment.lastIndexOf('/') + 1));
+            } else {
+                Log.e(TAG, "Failed to find working URL for segment: " + segment);
+            }
+        }
+    }
+
+    private class PrioritizedDownloadTask implements Runnable, Comparable<PrioritizedDownloadTask> {
+        private final String url;
+        private final int priority;
+
+        public PrioritizedDownloadTask(String url, int priority) {
+            this.url = url;
+            this.priority = priority;
+        }
+
+        @Override
+        public void run() {
+            downloadTs(url);
+        }
+
+        @Override
+        public int compareTo(PrioritizedDownloadTask other) {
+            return Integer.compare(this.priority, other.priority);
+        }
+    }
+
     private void downloadTs(String tsUrl) {
         String fileName = tsUrl.substring(tsUrl.lastIndexOf('/') + 1);
+        int segmentIndex = getSegmentIndex(fileName);
+        
+        // Prioritize segments that are coming up soon in playback
+        if (segmentIndex > currentPlayingSegment + BUFFER_SEGMENTS_AHEAD) {
+            // Delay downloading segments that are far ahead
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+
         File tsFile = new File(cacheDir, fileName);
         Log.d(TAG, "Downloading TS file: " + fileName);
 
@@ -468,6 +569,17 @@ public class M3U8Cache {
         updateProgress();
     }
 
+    private int getSegmentIndex(String fileName) {
+        try {
+            // Extract segment number from filename (assuming format *_XXXXX.ts)
+            String numStr = fileName.substring(fileName.lastIndexOf('_') + 1, fileName.lastIndexOf('.'));
+            return Integer.parseInt(numStr);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to parse segment index from " + fileName);
+            return -1;
+        }
+    }
+
     private void updateProgress() {
         if (cacheListener != null && !isCanceled) {
             int completed = completedSegments.get();
@@ -476,15 +588,12 @@ public class M3U8Cache {
 
             cacheListener.onProgress(completed, total, failed);
 
-            // Check if the threshold for starting playback has been reached
+            // Check if we have enough segments for playback
             if (!hasNotifiedReadyForPlayback && total > 0) {
                 float progress = (float) completed / total;
-                if (progress >= PLAYBACK_START_THRESHOLD) {
-                    hasNotifiedReadyForPlayback = true;
-                    saveLocalM3U8Partial(); // Save partially downloaded M3U8 files
-                    if (cacheListener != null) {
-                        cacheListener.onReadyForPlayback(new File(cacheDir, "index.m3u8").getAbsolutePath());
-                    }
+                // Wait for at least 80% of segments to be downloaded before starting playback
+                if (progress >= 0.8 && completed >= MINIMUM_SEGMENTS_FOR_PLAYBACK) {
+                    saveLocalM3U8Partial(); // This will handle the onReadyForPlayback notification
                 }
             }
         }
@@ -525,6 +634,17 @@ public class M3U8Cache {
             return;
         }
 
+        // Sort segments to ensure they are in correct order
+        verifiedSegments.sort((a, b) -> {
+            try {
+                int numA = Integer.parseInt(a.substring(a.lastIndexOf('_') + 1, a.lastIndexOf('.')));
+                int numB = Integer.parseInt(b.substring(b.lastIndexOf('_') + 1, b.lastIndexOf('.')));
+                return Integer.compare(numA, numB);
+            } catch (Exception e) {
+                return a.compareTo(b);
+            }
+        });
+
         // All files are verified, now write the M3U8 file
         File localM3U8 = new File(cacheDir, "index.m3u8");
         Log.d(TAG, "Saving local M3U8 file: " + localM3U8.getAbsolutePath());
@@ -533,67 +653,28 @@ public class M3U8Cache {
             writer.write("#EXTM3U\n");
             writer.write("#EXT-X-VERSION:3\n");
 
-            // Parse the original content to get the target duration
-            float maxDuration = 10.0f;
-            String[] lines = content.split("\n");
-            for (String line : lines) {
-                if (line.startsWith("#EXT-X-TARGETDURATION:")) {
-                    try {
-                        maxDuration = Float.parseFloat(line.substring(22));
-                        break;
-                    } catch (NumberFormatException e) {
-                        Log.w(TAG, "Failed to parse target duration, using default: " + maxDuration);
-                    }
-                }
+            // Find maximum segment duration
+            float maxDuration = 0;
+            for (String fileName : verifiedSegments) {
+                maxDuration = Math.max(maxDuration, getSegmentDuration(fileName));
             }
-
             writer.write("#EXT-X-TARGETDURATION:" + Math.ceil(maxDuration) + "\n");
+
             writer.write("#EXT-X-MEDIA-SEQUENCE:0\n");
             writer.write("#EXT-X-PLAYLIST-TYPE:VOD\n");
 
-            Map<String, String> extinfMap = new HashMap<>();
-            String currentExtinf = "#EXTINF:" + maxDuration + ",";
-
-            // Build EXTINF map from original content
-            for (int i = 0; i < lines.length; i++) {
-                String line = lines[i].trim();
-                if (line.startsWith("#EXTINF:")) {
-                    if (i + 1 < lines.length) {
-                        String nextLine = lines[i + 1].trim();
-                        if (!nextLine.startsWith("#") && nextLine.endsWith(".ts")) {
-                            String fileName = nextLine.substring(nextLine.lastIndexOf('/') + 1);
-                            extinfMap.put(fileName, line);
-                        }
-                    }
-                }
-            }
-
-            // Write segments with their EXTINF tags
+            // Write segments with their actual durations
+            float totalDuration = 0;
             for (String fileName : verifiedSegments) {
-                String extinf = extinfMap.getOrDefault(fileName, currentExtinf);
-                writer.write(extinf + "\n");
+                float duration = getSegmentDuration(fileName);
+                totalDuration += duration;
+                writer.write(String.format("#EXTINF:%.3f,\n", duration));
                 writer.write(fileName + "\n");
             }
 
             writer.write("#EXT-X-ENDLIST\n");
-        }
-
-        // Verify the written file
-        try (BufferedReader reader = new BufferedReader(new FileReader(localM3U8))) {
-            String line;
-            int segmentCount = 0;
-            while ((line = reader.readLine()) != null) {
-                if (!line.startsWith("#") && line.endsWith(".ts")) {
-                    segmentCount++;
-                }
-            }
-            Log.d(TAG, "Successfully saved local M3U8 file with " + segmentCount + " segments");
-            if (segmentCount == 0) {
-                Log.e(TAG, "Generated M3U8 file contains no segments!");
-                if (cacheListener != null) {
-                    cacheListener.onError("Generated M3U8 file contains no segments");
-                }
-            }
+            Log.d(TAG, String.format("Successfully saved local M3U8 file with %d segments, total duration: %.3f seconds", 
+                verifiedSegments.size(), totalDuration));
         }
     }
 
@@ -602,39 +683,99 @@ public class M3U8Cache {
             File localM3U8 = new File(cacheDir, "index.m3u8");
             Log.d(TAG, "Saving partial M3U8 file: " + localM3U8.getAbsolutePath());
 
-            List<String> verifiedSegments = new ArrayList<>();
-            for (String tsUrl : tsUrls) {
+            // Create a thread-safe copy of the URLs
+            List<String> urlsCopy;
+            synchronized (tsUrls) {
+                urlsCopy = new ArrayList<>(tsUrls);
+                Log.d(TAG, "Total segments in tsUrls: " + tsUrls.size());
+            }
+
+            // Sort segments to ensure they are in correct order
+            urlsCopy.sort((a, b) -> {
+                try {
+                    String fileNameA = a.substring(a.lastIndexOf('/') + 1);
+                    String fileNameB = b.substring(b.lastIndexOf('/') + 1);
+                    int numA = Integer.parseInt(fileNameA.substring(fileNameA.lastIndexOf('_') + 1, fileNameA.lastIndexOf('.')));
+                    int numB = Integer.parseInt(fileNameB.substring(fileNameB.lastIndexOf('_') + 1, fileNameB.lastIndexOf('.')));
+                    return Integer.compare(numA, numB);
+                } catch (Exception e) {
+                    return a.compareTo(b);
+                }
+            });
+
+            StringBuilder m3u8Content = new StringBuilder();
+            m3u8Content.append("#EXTM3U\n");
+            m3u8Content.append("#EXT-X-VERSION:3\n");
+            
+            // Find maximum segment duration
+            float maxDuration = 0;
+            for (String tsUrl : urlsCopy) {
+                String fileName = tsUrl.substring(tsUrl.lastIndexOf('/') + 1);
+                float duration = getSegmentDuration(fileName);
+                maxDuration = Math.max(maxDuration, duration);
+                Log.d(TAG, String.format("Segment %s has duration %.3f", fileName, duration));
+            }
+            m3u8Content.append("#EXT-X-TARGETDURATION:").append(Math.ceil(maxDuration)).append("\n");
+            
+            m3u8Content.append("#EXT-X-MEDIA-SEQUENCE:0\n");
+            m3u8Content.append("#EXT-X-ALLOW-CACHE:YES\n");
+            m3u8Content.append("#EXT-X-PLAYLIST-TYPE:VOD\n");
+
+            // Write all segments with their durations
+            float totalDuration = 0;
+            int segmentCount = 0;
+            for (String tsUrl : urlsCopy) {
+                String fileName = tsUrl.substring(tsUrl.lastIndexOf('/') + 1);
+                float duration = getSegmentDuration(fileName);
+                totalDuration += duration;
+                segmentCount++;
+                m3u8Content.append(String.format("#EXTINF:%.3f,\n", duration));
+                m3u8Content.append(fileName).append("\n");
+                Log.d(TAG, String.format("Writing segment %d: %s with duration %.3f", segmentCount, fileName, duration));
+            }
+
+            Log.d(TAG, String.format("Total segments written: %d, Total duration: %.3f", segmentCount, totalDuration));
+
+            // Add EXT-X-ENDLIST if all segments are downloaded
+            boolean allSegmentsDownloaded = true;
+            for (String tsUrl : urlsCopy) {
                 String fileName = tsUrl.substring(tsUrl.lastIndexOf('/') + 1);
                 File tsFile = new File(cacheDir, fileName);
-                if (tsFile.exists() && tsFile.length() > 0) {
-                    verifiedSegments.add(fileName);
+                if (!tsFile.exists() || tsFile.length() == 0) {
+                    allSegmentsDownloaded = false;
+                    Log.d(TAG, "Segment not yet downloaded: " + fileName);
+                    break;
                 }
             }
-
-            if (verifiedSegments.isEmpty()) {
-                Log.w(TAG, "No verified segments available yet");
-                return;
+            
+            if (allSegmentsDownloaded) {
+                m3u8Content.append("#EXT-X-ENDLIST\n");
+                Log.d(TAG, "All segments downloaded, adding EXT-X-ENDLIST");
             }
+
+            // Log the content before writing
+            Log.d(TAG, "M3U8 content to be written:\n" + m3u8Content.toString());
 
             try (FileWriter writer = new FileWriter(localM3U8)) {
-                writer.write("#EXTM3U\n");
-                writer.write("#EXT-X-VERSION:3\n");
-                writer.write("#EXT-X-TARGETDURATION:10\n");
-                writer.write("#EXT-X-MEDIA-SEQUENCE:0\n");
-                writer.write("#EXT-X-PLAYLIST-TYPE:EVENT\n"); // Use EVENT type to indicate that the playlist may be updated
-
-                // Write downloaded fragments
-                for (String fileName : verifiedSegments) {
-                    writer.write("#EXTINF:10.0,\n");
-                    writer.write(fileName + "\n");
-                }
-
-                // Do not write EXT-X-ENDLIST as it is still downloading
+                writer.write(m3u8Content.toString());
+                writer.flush();
             }
 
-            Log.d(TAG, "Successfully saved partial M3U8 file with " + verifiedSegments.size() + " segments");
+            // Verify the written file
+            if (localM3U8.exists() && localM3U8.length() > 0) {
+                Log.d(TAG, "Successfully wrote M3U8 file with size: " + localM3U8.length());
+            }
+
+            // Only notify if this is the first time we're ready for playback
+            if (cacheListener != null && !hasNotifiedReadyForPlayback) {
+                hasNotifiedReadyForPlayback = true;
+                cacheListener.onReadyForPlayback(localM3U8.getAbsolutePath());
+                Log.d(TAG, "Notified ready for playback");
+            }
+
         } catch (IOException e) {
             Log.e(TAG, "Failed to save partial M3U8 file", e);
+            e.printStackTrace();
         }
     }
 
@@ -702,5 +843,93 @@ public class M3U8Cache {
     public String getLocalM3U8Path() {
         File localM3U8 = new File(cacheDir, "index.m3u8");
         return localM3U8.exists() ? localM3U8.getAbsolutePath() : null;
+    }
+
+    public void setCurrentPlayingSegment(int segmentIndex) {
+        this.currentPlayingSegment = segmentIndex;
+    }
+
+    public float getSegmentDuration(String fileName) {
+        return segmentDurations.getOrDefault(fileName, defaultSegmentDuration);
+    }
+
+    public float getTotalDurationUpToSegment(int segmentIndex) {
+        float totalDuration = 0;
+        int currentIndex = 0;
+        for (String tsUrl : tsUrls) {
+            if (currentIndex >= segmentIndex) break;
+            String fileName = tsUrl.substring(tsUrl.lastIndexOf('/') + 1);
+            totalDuration += getSegmentDuration(fileName);
+            currentIndex++;
+        }
+        return totalDuration;
+    }
+
+    public int getTotalSegments() {
+        synchronized (tsUrls) {
+            return tsUrls.size();
+        }
+    }
+
+    public String getSegmentFileName(int index) {
+        synchronized (tsUrls) {
+            if (index < 0 || index >= tsUrls.size()) {
+                return null;
+            }
+            String tsUrl = tsUrls.get(index);
+            return tsUrl.substring(tsUrl.lastIndexOf('/') + 1);
+        }
+    }
+
+    public void ensureSegmentsCached(int startSegment, int endSegment) {
+        List<String> urlsToCache = new ArrayList<>();
+        synchronized (tsUrls) {
+            if (startSegment < 0 || endSegment >= tsUrls.size() || startSegment > endSegment) {
+                Log.w(TAG, "Invalid segment range: " + startSegment + " to " + endSegment);
+                return;
+            }
+
+            // Always try to cache BUFFER_SEGMENTS_AHEAD segments ahead of the current segment
+            endSegment = Math.min(startSegment + BUFFER_SEGMENTS_AHEAD, tsUrls.size() - 1);
+
+            for (int i = startSegment; i <= endSegment; i++) {
+                String tsUrl = tsUrls.get(i);
+                String fileName = tsUrl.substring(tsUrl.lastIndexOf('/') + 1);
+                File tsFile = new File(cacheDir, fileName);
+                
+                if (!tsFile.exists() || tsFile.length() == 0) {
+                    urlsToCache.add(tsUrl);
+                }
+            }
+        }
+
+        // Queue downloads outside of synchronized block with high priority
+        for (String tsUrl : urlsToCache) {
+            executor.execute(new PrioritizedDownloadTask(tsUrl, 1)); // Priority 1 for immediate segments
+        }
+
+        // Also queue next batch of segments with lower priority
+        int nextStartSegment = endSegment + 1;
+        int nextEndSegment = Math.min(nextStartSegment + BUFFER_SEGMENTS_AHEAD, getTotalSegments() - 1);
+        
+        if (nextStartSegment < getTotalSegments()) {
+            List<String> nextUrlsToCache = new ArrayList<>();
+            synchronized (tsUrls) {
+                for (int i = nextStartSegment; i <= nextEndSegment; i++) {
+                    String tsUrl = tsUrls.get(i);
+                    String fileName = tsUrl.substring(tsUrl.lastIndexOf('/') + 1);
+                    File tsFile = new File(cacheDir, fileName);
+                    
+                    if (!tsFile.exists() || tsFile.length() == 0) {
+                        nextUrlsToCache.add(tsUrl);
+                    }
+                }
+            }
+            
+            // Queue next batch with lower priority
+            for (String tsUrl : nextUrlsToCache) {
+                executor.execute(new PrioritizedDownloadTask(tsUrl, 2)); // Priority 2 for future segments
+            }
+        }
     }
 }
