@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.ldc.videocache"
-    compileSdk = 35
+    namespace = "com.ldc.videocache.demo"
+    compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.ldc.videocache"
+        applicationId = "com.ldc.videocache.demo"
         minSdk = 24
         targetSdk = 34
         versionCode = 1
@@ -50,7 +50,6 @@ android {
 }
 
 dependencies {
-
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
@@ -59,8 +58,15 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
+    implementation(libs.androidx.appcompat)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
+
+    implementation(project(":videocache"))
+    implementation(libs.exoplayer.core)
+    implementation(libs.exoplayer.ui)
+    implementation(libs.exoplayer.hls)
+    implementation(libs.exoplayer.dash)
 }

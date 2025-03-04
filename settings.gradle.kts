@@ -21,4 +21,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "VideoCache"
 include(":app")
- 
+include(":videocache")
