@@ -22,6 +22,7 @@ import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.io.FileOutputStream;
 
 public class M3U8Cache {
     private static final String TAG = "M3U8Cache";
@@ -408,9 +409,8 @@ public class M3U8Cache {
     private void queueSegmentDownloads(List<String> segments) {
         Log.d(TAG, "Starting to queue segment downloads for " + segments.size() + " segments");
         
-        // First, add all segments to tsUrls list to maintain the complete list
         synchronized (tsUrls) {
-            tsUrls.clear(); // Clear existing URLs to avoid duplicates
+            tsUrls.clear();
             for (String segment : segments) {
                 String fileName = segment.substring(segment.lastIndexOf('/') + 1);
                 String fullUrl = segment.startsWith("http") ? segment : baseUrl + segment;
@@ -420,44 +420,85 @@ public class M3U8Cache {
             Log.d(TAG, "Total segments in tsUrls after adding all: " + tsUrls.size());
         }
 
-        // Only queue initial segments for immediate download
-        int initialSegments = Math.min(MINIMUM_SEGMENTS_FOR_PLAYBACK + BUFFER_SEGMENTS_AHEAD, segments.size());
-        Log.d(TAG, "Queueing initial " + initialSegments + " segments for immediate download");
-
+        // Queue segments with appropriate priorities
         for (int i = 0; i < segments.size(); i++) {
             String segment = segments.get(i);
             String workingUrl = findWorkingTsUrl(segment);
             if (workingUrl != null) {
-                if (i < initialSegments) {
-                    // Queue initial segments with high priority
-                    executor.execute(new PrioritizedDownloadTask(workingUrl, 1));
-                    Log.d(TAG, "Queued initial segment for immediate download: " + segment.substring(segment.lastIndexOf('/') + 1));
+                int priority;
+                if (i < MINIMUM_SEGMENTS_FOR_PLAYBACK) {
+                    priority = 1; // Highest priority for minimum required segments
+                    Log.d(TAG, "Queueing initial segment with priority 1: " + segment);
+                } else if (i < MINIMUM_SEGMENTS_FOR_PLAYBACK + BUFFER_SEGMENTS_AHEAD) {
+                    priority = 2; // High priority for buffer segments
+                    Log.d(TAG, "Queueing buffer segment with priority 2: " + segment);
                 } else {
-                    // Queue remaining segments with lower priority
-                    executor.execute(new PrioritizedDownloadTask(workingUrl, 2));
-                    Log.d(TAG, "Queued remaining segment for background download: " + segment.substring(segment.lastIndexOf('/') + 1));
+                    priority = 3; // Normal priority for remaining segments
+                    Log.d(TAG, "Queueing remaining segment with priority 3: " + segment);
+                }
+                
+                // Create and queue the download task
+                PrioritizedDownloadTask task = new PrioritizedDownloadTask(workingUrl, priority);
+                executor.execute(task);
+                
+                // If this is a high priority segment, wait a bit to ensure order
+                if (priority == 1) {
+                    try {
+                        Thread.sleep(50); // Small delay to help maintain order for critical segments
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
                 }
             } else {
                 Log.e(TAG, "Failed to find working URL for segment: " + segment);
             }
         }
+        
+        Log.d(TAG, "Finished queueing all segment downloads");
     }
 
     private class PrioritizedDownloadTask implements Runnable, Comparable<PrioritizedDownloadTask> {
         private final String url;
-        private final int priority; // 1 = high priority (immediate download), 2 = low priority (background download)
+        private final int priority;
+        private final int segmentIndex;
 
         public PrioritizedDownloadTask(String url, int priority) {
             this.url = url;
             this.priority = priority;
+            
+            // Extract segment index from URL with better error handling
+            String fileName = url.substring(url.lastIndexOf('/') + 1);
+            int index = -1;
+            
+            try {
+                // First try to find the last underscore
+                int underscoreIndex = fileName.lastIndexOf('_');
+                if (underscoreIndex >= 0) {
+                    String numStr = fileName.substring(underscoreIndex + 1, fileName.lastIndexOf('.'));
+                    index = Integer.parseInt(numStr);
+                } else {
+                    // If no underscore, try to find numbers in the filename
+                    String numStr = fileName.replaceAll("[^0-9]", "");
+                    if (!numStr.isEmpty()) {
+                        index = Integer.parseInt(numStr);
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to parse segment index from filename: " + fileName);
+            }
+            
+            this.segmentIndex = index >= 0 ? index : 999999;
+            Log.d(TAG, String.format("Created download task for segment %s with index %d and priority %d", 
+                fileName, this.segmentIndex, priority));
         }
 
         @Override
         public void run() {
             if (priority > 1) {
-                // Add a small delay for background downloads to prioritize immediate downloads
+                // Add a smaller delay for background downloads
                 try {
-                    Thread.sleep(100);
+                    Thread.sleep(Math.min(25 * segmentIndex, 1000));
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return;
@@ -468,8 +509,13 @@ public class M3U8Cache {
 
         @Override
         public int compareTo(PrioritizedDownloadTask other) {
-            // Lower priority number means higher priority
-            return Integer.compare(this.priority, other.priority);
+            // First compare by priority
+            int priorityCompare = Integer.compare(this.priority, other.priority);
+            if (priorityCompare != 0) {
+                return priorityCompare;
+            }
+            // If same priority, compare by segment index
+            return Integer.compare(this.segmentIndex, other.segmentIndex);
         }
     }
 
@@ -495,6 +541,8 @@ public class M3U8Cache {
             Log.d(TAG, "TS file already exists: " + fileName);
             completedSegments.incrementAndGet();
             consecutiveFailures.set(0);
+            // Update M3U8 file to ensure this segment is included
+            saveLocalM3U8Partial();
             updateProgress();
             return;
         }
@@ -579,6 +627,11 @@ public class M3U8Cache {
                         Log.d(TAG, String.format("Successfully downloaded TS file: %s, size: %d bytes", fileName, totalBytes));
                         completedSegments.incrementAndGet();
                         consecutiveFailures.set(0);
+                        
+                        // Important: Update M3U8 file immediately after successful download
+                        // This ensures the player can access the new segment right away
+                        saveLocalM3U8Partial();
+                        
                         updateProgress();
                         return;
                     } else {
@@ -633,12 +686,11 @@ public class M3U8Cache {
 
             cacheListener.onProgress(completed, total, failed);
 
-            // Check if we have enough segments for playback
-            if (!hasNotifiedReadyForPlayback && total > 0) {
-                // Start playback as soon as we have MINIMUM_SEGMENTS_FOR_PLAYBACK segments
-                if (completed >= MINIMUM_SEGMENTS_FOR_PLAYBACK) {
-                    saveLocalM3U8Partial(); // This will handle the onReadyForPlayback notification
-                }
+            // Only notify if this is the first time we're ready for playback
+            if (!hasNotifiedReadyForPlayback && total > 0 && completed >= MINIMUM_SEGMENTS_FOR_PLAYBACK) {
+                hasNotifiedReadyForPlayback = true;
+                cacheListener.onReadyForPlayback(new File(cacheDir, "index.m3u8").getAbsolutePath());
+                Log.d(TAG, "Notified ready for playback with " + completed + " segments");
             }
         }
     }
@@ -727,71 +779,92 @@ public class M3U8Cache {
             File localM3U8 = new File(cacheDir, "index.m3u8");
             Log.d(TAG, "Saving partial M3U8 file: " + localM3U8.getAbsolutePath());
 
-            StringBuilder m3u8Content = new StringBuilder();
-            m3u8Content.append("#EXTM3U\n");
-            m3u8Content.append("#EXT-X-VERSION:3\n");
-            
-            // Find maximum segment duration from all segments
+            // Create empty.ts if it doesn't exist
+            File emptyTs = new File(cacheDir, "empty.ts");
+            if (!emptyTs.exists() || emptyTs.length() == 0) {
+                try (FileOutputStream fos = new FileOutputStream(emptyTs)) {
+                    // Write a valid TS packet
+                    byte[] tsPacket = new byte[188];
+                    tsPacket[0] = 0x47; // Sync byte
+                    tsPacket[1] = 0x1F; // PID 0x1FFF (null packet)
+                    tsPacket[2] = (byte) 0xFF;
+                    tsPacket[3] = 0x10; // Payload only
+
+                    // Write multiple packets
+                    for (int i = 0; i < 1000; i++) {
+                        fos.write(tsPacket);
+                    }
+                }
+                Log.d(TAG, "Created empty.ts file with valid TS packets");
+            }
+
+            // Collect and sort segments
+            List<String> orderedSegments = new ArrayList<>();
+            Map<String, Boolean> segmentDownloaded = new HashMap<>();
             float maxDuration = 0;
+            
             synchronized (tsUrls) {
                 for (String tsUrl : tsUrls) {
                     String fileName = tsUrl.substring(tsUrl.lastIndexOf('/') + 1);
                     float duration = getSegmentDuration(fileName);
                     maxDuration = Math.max(maxDuration, duration);
-                }
-            }
-            m3u8Content.append("#EXT-X-TARGETDURATION:").append(Math.ceil(maxDuration)).append("\n");
-            
-            m3u8Content.append("#EXT-X-MEDIA-SEQUENCE:0\n");
-            m3u8Content.append("#EXT-X-ALLOW-CACHE:YES\n");
-            m3u8Content.append("#EXT-X-PLAYLIST-TYPE:VOD\n");  // Changed to VOD type
-
-            float totalDuration = 0;
-            int segmentCount = 0;
-            int downloadedCount = 0;
-
-            // Write all segments, including those not yet downloaded
-            synchronized (tsUrls) {
-                for (String tsUrl : tsUrls) {
-                    String fileName = tsUrl.substring(tsUrl.lastIndexOf('/') + 1);
-                    float duration = getSegmentDuration(fileName);
-                    totalDuration += duration;
-                    segmentCount++;
-
+                    
                     File tsFile = new File(cacheDir, fileName);
-                    if (tsFile.exists() && tsFile.length() > 0) {
-                        downloadedCount++;
-                        m3u8Content.append(String.format("#EXTINF:%.3f,\n", duration));
-                        m3u8Content.append(fileName).append("\n");
-                    } else {
-                        // For segments not yet downloaded, use a dummy segment
-                        m3u8Content.append(String.format("#EXTINF:%.3f,\n", duration));
-                        m3u8Content.append("#EXT-X-DISCONTINUITY\n"); // Add discontinuity marker
-                        m3u8Content.append("dummy_" + fileName + "\n"); // Use dummy segment name
-                    }
+                    segmentDownloaded.put(fileName, tsFile.exists() && tsFile.length() > 0);
+                    orderedSegments.add(fileName);
+                }
+            }
+            
+            // Sort segments by index
+            orderedSegments.sort((a, b) -> {
+                try {
+                    int numA = Integer.parseInt(a.substring(a.lastIndexOf('_') + 1, a.lastIndexOf('.')));
+                    int numB = Integer.parseInt(b.substring(b.lastIndexOf('_') + 1, b.lastIndexOf('.')));
+                    return Integer.compare(numA, numB);
+                } catch (Exception e) {
+                    return a.compareTo(b);
+                }
+            });
+
+            // Write M3U8 content
+            StringBuilder m3u8Content = new StringBuilder();
+            m3u8Content.append("#EXTM3U\n");
+            m3u8Content.append("#EXT-X-VERSION:3\n");
+            m3u8Content.append("#EXT-X-TARGETDURATION:").append(Math.ceil(maxDuration)).append("\n");
+            m3u8Content.append("#EXT-X-MEDIA-SEQUENCE:0\n");
+            m3u8Content.append("#EXT-X-PLAYLIST-TYPE:VOD\n");
+            m3u8Content.append("#EXT-X-START:TIME-OFFSET=0\n");
+
+            // Write all segments to maintain total duration
+            float totalDuration = 0;
+            int downloadedCount = 0;
+            
+            for (String fileName : orderedSegments) {
+                float duration = getSegmentDuration(fileName);
+                totalDuration += duration;
+                m3u8Content.append(String.format("#EXTINF:%.3f,\n", duration));
+                
+                if (segmentDownloaded.get(fileName)) {
+                    m3u8Content.append(fileName).append("\n");
+                    downloadedCount++;
+                } else {
+                    // For undownloaded segments, use the actual segment name instead of empty.ts
+                    m3u8Content.append(fileName).append("\n");
                 }
             }
 
-            // Always add ENDLIST tag to ensure player knows the total duration
+            // Always add ENDLIST tag to ensure total duration is shown
             m3u8Content.append("#EXT-X-ENDLIST\n");
 
-            Log.d(TAG, String.format("Writing M3U8 with %d total segments (%d downloaded), total duration: %.3f seconds", 
-                segmentCount, downloadedCount, totalDuration));
-
-            // Log the content before writing
-            Log.d(TAG, "M3U8 content to be written:\n" + m3u8Content.toString());
-
+            // Write the content to file
             try (FileWriter writer = new FileWriter(localM3U8)) {
                 writer.write(m3u8Content.toString());
-                writer.flush();
             }
 
-            // Verify the written file
-            if (localM3U8.exists() && localM3U8.length() > 0) {
-                Log.d(TAG, "Successfully wrote M3U8 file with size: " + localM3U8.length());
-            }
+            Log.d(TAG, String.format("M3U8 update complete - Downloaded: %d/%d segments, Total duration: %.3f seconds", 
+                downloadedCount, orderedSegments.size(), totalDuration));
 
-            // Only notify if this is the first time we're ready for playback and we have enough segments
+            // Notify ready for playback if we have enough segments
             if (cacheListener != null && !hasNotifiedReadyForPlayback && downloadedCount >= MINIMUM_SEGMENTS_FOR_PLAYBACK) {
                 hasNotifiedReadyForPlayback = true;
                 cacheListener.onReadyForPlayback(localM3U8.getAbsolutePath());
