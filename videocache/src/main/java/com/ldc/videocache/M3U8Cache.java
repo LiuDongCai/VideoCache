@@ -5,7 +5,6 @@ import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStreamReader;
@@ -17,7 +16,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -31,13 +29,10 @@ public class M3U8Cache {
     private static final int MAX_RETRY_COUNT = 3;
     private static final int RETRY_DELAY_MS = 1000;
     private static final int VALIDATION_TIMEOUT = 5000; // 5 seconds for validation
-    private static final int MAX_VALIDATION_RETRIES = 2;
     private static final int BUFFER_SEGMENTS_AHEAD = 8;
     private static final int CORE_POOL_SIZE = 5;
     private static final int MAX_POOL_SIZE = 8;
     private static final int KEEP_ALIVE_TIME = 60; // seconds
-    private static final int INITIAL_SEGMENTS_TO_CACHE = 12;
-    private static final float PLAYBACK_START_THRESHOLD = 0.4f;
     private static final int MINIMUM_SEGMENTS_FOR_PLAYBACK = 3;
 
     private String baseUrl;
@@ -55,7 +50,6 @@ public class M3U8Cache {
     private volatile int currentPlayingSegment = 0;
     private Map<String, Float> segmentDurations = new HashMap<>();
     private float defaultSegmentDuration = 10.0f;
-    private float totalDurationSeconds = 0;  // Add this field to track total duration
 
     public interface CacheListener {
         void onProgress(int completed, int total, int failed);
@@ -171,7 +165,7 @@ public class M3U8Cache {
             List<String> segments = parseM3U8(content);
             Log.d(TAG, "Found " + segments.size() + " segments in M3U8");
 
-            // 验证第一个分片的可访问性
+            // Verify the accessibility of the first shard
             if (!segments.isEmpty()) {
                 String firstSegment = segments.get(0);
                 String workingUrl = findWorkingTsUrl(firstSegment);
@@ -183,7 +177,7 @@ public class M3U8Cache {
                     }
                     return;
                 }
-                // 如果找到了可用的URL，更新baseUrl
+                // If an available URL is found, update the baseURL
                 if (!workingUrl.equals(baseUrl + firstSegment)) {
                     String newBaseUrl = workingUrl.substring(0, workingUrl.lastIndexOf('/') + 1);
                     Log.d(TAG, "Updating base URL to: " + newBaseUrl);
@@ -359,7 +353,6 @@ public class M3U8Cache {
         String[] lines = content.split("\n");
         float currentDuration = -1;
         int segmentCount = 0;
-        float totalDuration = 0;  // Track total duration while parsing
 
         Log.d(TAG, "Starting to parse M3U8 content...");
 
@@ -372,7 +365,6 @@ public class M3U8Cache {
                         durationStr = durationStr.substring(0, durationStr.indexOf(','));
                     }
                     currentDuration = Float.parseFloat(durationStr);
-                    totalDuration += currentDuration;  // Add to total duration
                     Log.d(TAG, "Found segment " + (segmentCount + 1) + " with duration: " + currentDuration);
                 } catch (Exception e) {
                     Log.w(TAG, "Failed to parse EXTINF duration: " + line, e);
@@ -388,14 +380,10 @@ public class M3U8Cache {
                 } else {
                     Log.w(TAG, "No valid duration found for segment: " + fileName + ", using default duration");
                     segmentDurations.put(fileName, defaultSegmentDuration);
-                    totalDuration += defaultSegmentDuration;
                 }
                 currentDuration = -1;
             }
         }
-
-        this.totalDurationSeconds = totalDuration;  // Store the total duration
-        Log.d(TAG, String.format("Total duration of all segments: %.3f seconds", totalDuration));
 
         if (segments.isEmpty()) {
             Log.w(TAG, "No TS segments found in playlist");
@@ -880,29 +868,6 @@ public class M3U8Cache {
     public void updatePartialM3U8() {
         if (isDownloading && hasNotifiedReadyForPlayback) {
             saveLocalM3U8Partial();
-        }
-    }
-
-    private void verifyTsFiles() {
-        boolean allFilesAccessible = true;
-        StringBuilder missingFiles = new StringBuilder();
-
-        for (String tsUrl : tsUrls) {
-            String fileName = tsUrl.substring(tsUrl.lastIndexOf('/') + 1);
-            File tsFile = new File(cacheDir, fileName);
-            if (!tsFile.exists() || tsFile.length() == 0) {
-                Log.e(TAG, "TS file not accessible: " + fileName);
-                allFilesAccessible = false;
-                missingFiles.append(fileName).append(", ");
-            }
-        }
-
-        if (!allFilesAccessible) {
-            String error = "The following video clips cannot be accessed: " + missingFiles.toString();
-            Log.e(TAG, "Not all TS files are accessible: " + error);
-            if (cacheListener != null) {
-                cacheListener.onError(error);
-            }
         }
     }
 

@@ -195,8 +195,8 @@ public class VideoCacheActivity extends AppCompatActivity {
         player.stop();
         player.clearMediaItems();
         
-        String m3u8Url = "https://video.591.com.tw/online/target/hls/union/2023/05/08/pc/1683516699736-859624-476554.m3u8";
-//        String m3u8Url = "https://video.591.com.tw/online/target/house/hls/2024-07-04/1038836/master.m3u8";
+//        String m3u8Url = "https://video.591.com.tw/online/target/hls/union/2023/05/08/pc/1683516699736-859624-476554.m3u8";
+        String m3u8Url = "https://video.591.com.tw/online/target/house/hls/2024-07-04/1038836/master.m3u8";
         startM3u8Cache(m3u8Url);
     }
 
