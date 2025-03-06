@@ -78,45 +78,6 @@ public class VideoCacheActivity extends AppCompatActivity {
                         break;
                 }
             }
-
-            @Override
-            public void onPositionDiscontinuity(Player.PositionInfo oldPosition, 
-                                              Player.PositionInfo newPosition, 
-                                              @Player.DiscontinuityReason int reason) {
-                if (m3u8Cache != null) {
-                    // Calculate current segment based on accumulated durations
-                    long positionMs = player.getCurrentPosition();
-                    float positionSeconds = positionMs / 1000.0f;
-                    float accumulatedDuration = 0;
-                    int currentSegment = 0;
-                    
-                    // Get total segments
-                    int totalSegments = m3u8Cache.getTotalSegments();
-                    
-                    // Find current segment based on position
-                    while (currentSegment < totalSegments) {
-                        float segmentDuration = m3u8Cache.getSegmentDuration(
-                            m3u8Cache.getSegmentFileName(currentSegment)
-                        );
-                        if (accumulatedDuration + segmentDuration > positionSeconds) {
-                            break;
-                        }
-                        accumulatedDuration += segmentDuration;
-                        currentSegment++;
-                    }
-                    
-                    // Update current playing segment
-                    m3u8Cache.setCurrentPlayingSegment(currentSegment);
-                    
-                    // Pre-fetch next segments if needed
-                    if (currentSegment >= 0 && currentSegment < totalSegments) {
-                        m3u8Cache.ensureSegmentsCached(
-                            currentSegment,
-                            Math.min(currentSegment + BUFFER_SEGMENTS_AHEAD, totalSegments - 1)
-                        );
-                    }
-                }
-            }
         });
 
         // MP4视频示例
@@ -194,7 +155,7 @@ public class VideoCacheActivity extends AppCompatActivity {
         // 停止当前播放
         player.stop();
         player.clearMediaItems();
-        
+
 //        String m3u8Url = "https://video.591.com.tw/online/target/hls/union/2023/05/08/pc/1683516699736-859624-476554.m3u8";
         String m3u8Url = "https://video.591.com.tw/online/target/house/hls/2024-07-04/1038836/master.m3u8";
         startM3u8Cache(m3u8Url);
@@ -213,14 +174,14 @@ public class VideoCacheActivity extends AppCompatActivity {
                     statusText.setText(progress);
                 });
             }
-            
+
             @Override
             public void onError(String error) {
                 runOnUiThread(() -> {
                     statusText.setText("Error: " + error);
                 });
             }
-            
+
             @Override
             public void onComplete(boolean success, String localPath) {
                 isM3u8Caching = false;
@@ -230,14 +191,14 @@ public class VideoCacheActivity extends AppCompatActivity {
                     });
                 }
             }
-            
+
             @Override
             public void onReadyForPlayback(String localPath) {
                 runOnUiThread(() -> {
                     statusText.setText("Starting playback while caching...");
                     startPlayback(localPath);
                 });
-                
+
                 // 开始定期更新M3U8文件
                 startPeriodicM3u8Updates();
             }
@@ -250,7 +211,7 @@ public class VideoCacheActivity extends AppCompatActivity {
         handler.postDelayed(new Runnable() {
             @Override
             public void run() {
-                if (isM3u8Caching && m3u8Cache != null) {
+                if (isM3u8Caching && m3u8Cache != null && !m3u8Cache.isCompleted()) {
                     m3u8Cache.updatePartialM3U8();
                     handler.postDelayed(this, UPDATE_INTERVAL);
                 }
@@ -275,54 +236,6 @@ public class VideoCacheActivity extends AppCompatActivity {
             // 设置播放器
             player.setMediaSource(mediaSource);
             player.prepare();
-            
-            // 添加错误监听
-            player.addListener(new Player.Listener() {
-                @Override
-                public void onPlayerError(PlaybackException error) {
-                    Log.e(TAG, "Player error: " + error.getMessage());
-                    statusText.setText("Playback error: " + error.getMessage());
-                }
-
-                @Override
-                public void onPositionDiscontinuity(Player.PositionInfo oldPosition, 
-                                                  Player.PositionInfo newPosition, 
-                                                  @Player.DiscontinuityReason int reason) {
-                    if (m3u8Cache != null) {
-                        // Calculate current segment based on accumulated durations
-                        long positionMs = player.getCurrentPosition();
-                        float positionSeconds = positionMs / 1000.0f;
-                        float accumulatedDuration = 0;
-                        int currentSegment = 0;
-                        
-                        // Get total segments
-                        int totalSegments = m3u8Cache.getTotalSegments();
-                        
-                        // Find current segment based on position
-                        while (currentSegment < totalSegments) {
-                            float segmentDuration = m3u8Cache.getSegmentDuration(
-                                m3u8Cache.getSegmentFileName(currentSegment)
-                            );
-                            if (accumulatedDuration + segmentDuration > positionSeconds) {
-                                break;
-                            }
-                            accumulatedDuration += segmentDuration;
-                            currentSegment++;
-                        }
-                        
-                        // Update current playing segment
-                        m3u8Cache.setCurrentPlayingSegment(currentSegment);
-                        
-                        // Pre-fetch next segments if needed
-                        if (currentSegment >= 0 && currentSegment < totalSegments) {
-                            m3u8Cache.ensureSegmentsCached(
-                                currentSegment,
-                                Math.min(currentSegment + BUFFER_SEGMENTS_AHEAD, totalSegments - 1)
-                            );
-                        }
-                    }
-                }
-            });
             
             player.setPlayWhenReady(true);
             
