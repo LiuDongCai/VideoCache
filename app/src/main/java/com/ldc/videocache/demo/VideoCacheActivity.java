@@ -22,6 +22,8 @@ import com.ldc.videocache.VideoCacheManager;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.Timer;
+import java.util.TimerTask;
 
 public class VideoCacheActivity extends AppCompatActivity {
     private static final String TAG = "VideoCacheActivity";
@@ -31,9 +33,7 @@ public class VideoCacheActivity extends AppCompatActivity {
     private M3U8Cache m3u8Cache;
     private VideoCacheManager cacheManager;
     private boolean isM3u8Caching = false;
-    private Handler handler;
     private static final int UPDATE_INTERVAL = 500; // Update every 500ms for smoother playback
-    private static final int BUFFER_SEGMENTS_AHEAD = 5; // Define BUFFER_SEGMENTS_AHEAD
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -86,7 +86,6 @@ public class VideoCacheActivity extends AppCompatActivity {
         // M3U8视频示例
         playM3u8Button.setOnClickListener(v -> startVideoCache());
 
-        handler = new Handler(Looper.getMainLooper());
     }
 
     private void playMp4Video() {
@@ -142,6 +141,7 @@ public class VideoCacheActivity extends AppCompatActivity {
             
             // 设置到播放器并开始播放
             player.setMediaItem(mediaItem);
+
             player.prepare();
             player.play();
             
@@ -157,7 +157,8 @@ public class VideoCacheActivity extends AppCompatActivity {
         player.clearMediaItems();
 
 //        String m3u8Url = "https://video.591.com.tw/online/target/hls/union/2023/05/08/pc/1683516699736-859624-476554.m3u8";
-        String m3u8Url = "https://video.591.com.tw/online/target/house/hls/2024-07-04/1038836/master.m3u8";
+//        String m3u8Url = "https://video.591.com.tw/online/target/house/hls/2024-07-04/1038836/master.m3u8";
+        String m3u8Url = "https://video.591.com.tw/debug/target/hls/union/2025/01/13/mobile/8756-183050-884672.m3u8";
         startM3u8Cache(m3u8Url);
     }
 
@@ -200,23 +201,22 @@ public class VideoCacheActivity extends AppCompatActivity {
                 });
 
                 // 开始定期更新M3U8文件
-                startPeriodicM3u8Updates();
+                Timer timer = new Timer();
+                timer.schedule(new TimerTask() {
+                    @Override
+                    public void run() {
+                        if (isM3u8Caching && m3u8Cache != null && !m3u8Cache.isCompleted()) {
+                            m3u8Cache.updatePartialM3U8();
+                        }else{
+                            timer.cancel();
+                        }
+                    }
+                }, 0, UPDATE_INTERVAL);
+
             }
         });
         
         new Thread(() -> m3u8Cache.cache(url)).start();
-    }
-    
-    private void startPeriodicM3u8Updates() {
-        handler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (isM3u8Caching && m3u8Cache != null && !m3u8Cache.isCompleted()) {
-                    m3u8Cache.updatePartialM3U8();
-                    handler.postDelayed(this, UPDATE_INTERVAL);
-                }
-            }
-        }, UPDATE_INTERVAL);
     }
     
     private void startPlayback(String localPath) {
@@ -248,9 +248,6 @@ public class VideoCacheActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        if (handler != null) {
-            handler.removeCallbacksAndMessages(null);
-        }
         if (m3u8Cache != null) {
             m3u8Cache.cancel();
         }
