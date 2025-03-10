@@ -33,7 +33,7 @@ public class VideoCacheActivity extends AppCompatActivity {
     private M3U8Cache m3u8Cache;
     private VideoCacheManager cacheManager;
     private boolean isM3u8Caching = false;
-    private static final int UPDATE_INTERVAL = 500; // Update every 500ms for smoother playback
+    private static final int UPDATE_INTERVAL = 200; // Update every 200ms for smoother playback
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {

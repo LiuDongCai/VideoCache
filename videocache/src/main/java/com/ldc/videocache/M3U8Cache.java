@@ -29,11 +29,11 @@ public class M3U8Cache {
     private static final int MAX_RETRY_COUNT = 3;
     private static final int RETRY_DELAY_MS = 1000;
     private static final int VALIDATION_TIMEOUT = 5000; // 5 seconds for validation
-    private static final int BUFFER_SEGMENTS_AHEAD = 8;
+    private static final int BUFFER_SEGMENTS_AHEAD = 16;
     private static final int CORE_POOL_SIZE = 5;
     private static final int MAX_POOL_SIZE = 8;
     private static final int KEEP_ALIVE_TIME = 60; // seconds
-    private static final int MINIMUM_SEGMENTS_FOR_PLAYBACK = 3;
+    private static final int MINIMUM_SEGMENTS_FOR_PLAYBACK = 5;
 
     private String baseUrl;
     private final File cacheDir;
